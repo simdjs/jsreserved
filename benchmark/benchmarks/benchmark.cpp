@@ -178,7 +178,10 @@ std::optional<int> jsreserved_naive(std::string_view s) {
 }
 
 auto gperf_jsreserved_fn = [](std::string_view s) -> std::optional<int> {
-  auto result = JsReservedGperf::lookup(s.data(), s.size());
+  char buf[16] = {0};
+  size_t copy_len = std::min(s.size(), size_t(16));
+  std::memcpy(buf, s.data(), copy_len);
+  auto result = JsReservedGperf::lookup(buf, s.size());
   if (result) return static_cast<int>(*result);
   return std::nullopt;
 };
