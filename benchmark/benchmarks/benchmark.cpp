@@ -1,5 +1,6 @@
 
 #include <algorithm>
+#include <arm_neon.h>
 #include <cstdint>
 #include <cstring>
 #include <format>
@@ -11,6 +12,7 @@
 #include <set>
 #include <string>
 #include "gperf_neon.h"
+#include "simdjs.hh"
 #include "counters/bench.h"
 
 // ============================================================================
@@ -106,12 +108,13 @@ std::vector<std::string_view> build_input(
 }
 
 // Generic benchmark: runs PHF, naive, and unordered_map on a given input vector.
-template <typename NaiveFn, typename GperfFn>
+template <typename NaiveFn, typename GperfFn, typename SimdJSFn>
 void bench_workload(const std::string &label,
                     std::vector<std::string_view> &input,
                     size_t num_strings,
                     NaiveFn naive_fn,
                     GperfFn gperf_fn,
+		    SimdJSFn simdjs_fn,
                     const BenchFilter &filter,
                     bool describe) {
   std::vector<int> results(num_strings, 0);
@@ -148,6 +151,20 @@ void bench_workload(const std::string &label,
                  shuffle_bench(gperf_bench, shuffle));
     volatile auto sum = std::accumulate(results.begin(), results.end(), 0); // prevent optimization
   }
+
+  // simdjs
+  if (filter.run_method("simdjs")) {
+    gen.seed(42);
+    auto simdjs_bench = [&]() {
+      for (size_t i = 0; i < input.size(); i++) {
+        auto result = simdjs_fn(input[i]);
+        if (result) results[i] = *result;
+      }
+    };
+    pretty_print(label + " simdjs", num_strings,
+                 shuffle_bench(simdjs_bench, shuffle));
+    volatile auto sum = std::accumulate(results.begin(), results.end(), 0); // prevent optimization
+  }
 }
 
 std::optional<int> jsreserved_naive(std::string_view s) {
@@ -182,15 +199,27 @@ auto gperf_jsreserved_fn = [](std::string_view s) -> std::optional<int> {
   size_t copy_len = std::min(s.size(), size_t(16));
   std::memcpy(buf, s.data(), copy_len);
   auto result = JsReservedGperf::lookup(buf, s.size());
-  if (result) return static_cast<int>(*result);
+  if (result)
+    return static_cast<int>(*result);
+  return std::nullopt;
+};
+
+auto simdjs_jsreserved_fn = [](std::string_view s) -> std::optional<int> {
+  char buf[64] = {0};
+  size_t copy_len = std::min(s.size(), size_t(64));
+  std::memcpy(buf, s.data(), copy_len);
+  auto classified = simdjs::classify<uint8x16x4_t>((uint8_t*)buf);
+  auto [result, _] = simdjs::is_keyword(buf);
+  if (result) return static_cast<int>(result);
   return std::nullopt;
 };
 
 // Run a full key-set benchmark with all three workload modes.
-template <typename NaiveFn, typename GperfFn>
+template <typename NaiveFn, typename GperfFn, typename SimdJSFn>
 void run_keyset(const std::string &name,
                 NaiveFn naive_fn,
                 GperfFn gperf_fn,
+		SimdJSFn simdjs_fn,
                 const std::vector<std::string_view> &hit_keys,
                 const std::vector<std::string_view> &miss_keys,
                 const BenchFilter &filter,
@@ -220,15 +249,15 @@ void run_keyset(const std::string &name,
 
   if (filter.run_workload("hits")) {
     std::println("  --- all hits ---");
-    bench_workload("hits  ", hits, num_strings, jsreserved_naive, gperf_jsreserved_fn, filter, describe);
+    bench_workload("hits  ", hits, num_strings, jsreserved_naive, gperf_jsreserved_fn, simdjs_jsreserved_fn, filter, describe);
   }
   if (filter.run_workload("misses")) {
     std::println("  --- all misses ---");
-    bench_workload("misses", misses, num_strings, jsreserved_naive, gperf_jsreserved_fn, filter, describe);
+    bench_workload("misses", misses, num_strings, jsreserved_naive, gperf_jsreserved_fn, simdjs_jsreserved_fn, filter, describe);
   }
   if (filter.run_workload("mixed")) {
     std::println("  --- mixed (50/50) ---");
-    bench_workload("mixed ", mixed, num_strings, jsreserved_naive, gperf_jsreserved_fn, filter, describe);
+    bench_workload("mixed ", mixed, num_strings, jsreserved_naive, gperf_jsreserved_fn, simdjs_jsreserved_fn, filter, describe);
   }
 }
 
@@ -237,10 +266,11 @@ void run_keyset(const std::string &name,
 // Verification
 // ============================================================================
 
-template <typename NaiveFn, typename GperfFn>
+template <typename NaiveFn, typename GperfFn, typename SimdJSFn>
 bool verify_keyset(const std::string &name,
                    NaiveFn naive_fn,
                    GperfFn gperf_fn,
+		   SimdJSFn simdjs_fn,
                    const std::vector<std::string_view> &hit_keys,
                    const std::vector<std::string_view> &miss_keys) {
   bool ok = true;
@@ -286,7 +316,15 @@ bool verify_keyset(const std::string &name,
         fail(std::format("gperf: false positive for miss key '{}'", key));
     }
 
-
+    // simdjs
+    auto simdjs_result = simdjs_fn(key);
+    if (is_hit) {
+      if (!simdjs_result)
+        fail(std::format("simdjs: missed hit key '{}'", key));
+    } else {
+      if (simdjs_result)
+        fail(std::format("simdjs: false positive for miss key '{}'", key));
+    }
   }
 
   std::println("  {} {}", ok ? "OK" : "FAIL", name);
@@ -337,7 +375,7 @@ int main(int argc, char *argv[]) {
 
   // --- JavaScript Reserved Words (45 keys, medium) ---
   if (filter.run_keyset("jsreserved")) {
-    run_keyset("JavaScript Reserved Words", jsreserved_naive, gperf_jsreserved_fn,
+    run_keyset("JavaScript Reserved Words", jsreserved_naive, gperf_jsreserved_fn, simdjs_jsreserved_fn,
       {"await","break","case","catch","class","const","continue","debugger","default","delete",
        "do","else","enum","export","extends","false","finally","for","function","if",
        "import","in","instanceof","new","null","return","super","switch","this","throw",
