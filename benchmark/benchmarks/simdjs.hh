@@ -1,0 +1,114 @@
+#pragma once
+
+#include <arm_neon.h>
+
+namespace simdjs {
+  struct KeywordEntry {
+    uint8_t len;
+    uint8_t offset;
+  };
+
+  const int NB_KEYWORDS = 46;
+  alignas(8) const std::string_view scs = "awaithrowithisupereturnewhiletypeofalselsenumforimplementsvarifunctionullprivatepackageinstanceofinallydoimportinterfacevoidefaultryieldeletecontinueprotectedebuggerclasscatchpubliconstaticasexportruextendswitchbreak   ";
+  alignas(8) const uint8_t g_values[26] = {1, 1, 9, 3, 0, 9, 44, 7, 1, 0, 0, 27, 3, 18, 6, 0, 0, 26, 1, 13, 33, 3, 25, 0, 5, 0};
+  const KeywordEntry KEYWORD_DATA[NB_KEYWORDS] = {
+    {.len = 3, .offset = 22},
+    {.len = 3, .offset = 129},
+    {.len = 8, .offset = 62},
+    {.len = 4, .offset = 8},
+    {.len = 4, .offset = 196},
+    {.len = 4, .offset = 38},
+    {.len = 5, .offset = 211},
+    {.len = 7, .offset = 80},
+    {.len = 7, .offset = 199},
+    {.len = 6, .offset = 135},
+    {.len = 7, .offset = 73},
+    {.len = 4, .offset = 120},
+    {.len = 9, .offset = 149},
+    {.len = 5, .offset = 131},
+    {.len = 4, .offset = 188},
+    {.len = 10, .offset = 48},
+    {.len = 5, .offset = 165},
+    {.len = 2, .offset = 103},
+    {.len = 8, .offset = 141},
+    {.len = 4, .offset = 10},
+    {.len = 5, .offset = 0},
+    {.len = 2, .offset = 61},
+    {.len = 7, .offset = 96},
+    {.len = 5, .offset = 4},
+    {.len = 7, .offset = 123},
+    {.len = 6, .offset = 191},
+    {.len = 6, .offset = 105},
+    {.len = 6, .offset = 205},
+    {.len = 6, .offset = 29},
+    {.len = 6, .offset = 183},
+    {.len = 4, .offset = 69},
+    {.len = 5, .offset = 24},
+    {.len = 5, .offset = 13},
+    {.len = 3, .offset = 58},
+    {.len = 5, .offset = 170},
+    {.len = 8, .offset = 157},
+    {.len = 9, .offset = 111},
+    {.len = 6, .offset = 17},
+    {.len = 10, .offset = 87},
+    {.len = 2, .offset = 87},
+    {.len = 4, .offset = 41},
+    {.len = 5, .offset = 34},
+    {.len = 6, .offset = 175},
+    {.len = 3, .offset = 27},
+    {.len = 3, .offset = 45},
+    {.len = 5, .offset = 180},
+  };
+
+  int get_cichelli_hash(const std::string_view s) {
+    int len = static_cast<int>(s.size());
+    int first = s.front() - 'a';
+    int mid = s[len / 2] - 'a';
+    int last = s.back() - 'a';
+    auto isalpha = !((first | mid | last) < 0);
+
+    // h(w) = (length + g(first) + g(middle) + g(last)) % n
+    return isalpha ? (s.size() + g_values[first] + g_values[mid] + g_values[last]) % NB_KEYWORDS : 0;
+  }
+
+  auto is_keyword(std::string_view s, uint8_t prev_size = 0) -> std::pair<int, bool> {
+    //assert(prev_size <= 9);
+
+    // std::println("check: '{}'", s);
+    if (s.size() <= 10) {
+      if (prev_size != 0) {
+	s = std::string_view{(const char *)s.data() - prev_size, prev_size + s.size()};
+      }
+
+      const int h = get_cichelli_hash(s);
+      const uint8_t len = KEYWORD_DATA[h].len;
+
+      // if (s.size() != len) return {-1, false};
+
+      const auto entry = &scs[KEYWORD_DATA[h].offset];
+      uint64_t s_first8;
+      uint64_t entry_first8;
+      uint64_t mask = (len >= 8) ? ~0ULL : (1ULL << (len * 8)) - 1;
+
+      // this should be fine if we pad at the end
+      std::memcpy(&s_first8, s.data(), 8);
+      std::memcpy(&entry_first8, entry, 8);
+
+      auto match = (s_first8 & mask) == (entry_first8 & mask);
+
+      if (len <= 8) return {h, match};
+
+      uint16_t s_tail;
+      uint16_t entry_tail;
+      uint16_t mask2 = len == 10 ? 0xFFFF : 0x00FF;
+
+      std::memcpy(&s_tail, s.data() + 8, 2);
+      std::memcpy(&entry_tail, entry + 8, 2);
+      match &= (s_tail & mask2) == (entry_tail & mask2);
+
+      // if (match) std::println("{} is a keyword", s);
+      return {h, match};
+    }
+    return {-1, false};
+  }
+};
