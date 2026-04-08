@@ -205,10 +205,9 @@ auto gperf_jsreserved_fn = [](std::string_view s) -> std::optional<int> {
 };
 
 auto simdjs_jsreserved_fn = [](std::string_view s) -> std::optional<int> {
-  char buf[64] = {0};
-  size_t copy_len = std::min(s.size(), size_t(64));
+  char buf[16] = {0};
+  size_t copy_len = std::min(s.size(), size_t(16));
   std::memcpy(buf, s.data(), copy_len);
-  auto classified = simdjs::classify<uint8x16x4_t>((uint8_t*)buf);
   auto [result, _] = simdjs::is_keyword(buf);
   if (result) return static_cast<int>(result);
   return std::nullopt;
