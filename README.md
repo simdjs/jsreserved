@@ -1,4 +1,4 @@
-# jsreserved
+# jsreserved [![CI](https://github.com/simdjs/jsreserved/actions/workflows/ci.yml/badge.svg)](https://github.com/simdjs/jsreserved/actions/workflows/ci.yml)
 
 Fast recognition of JavaScript reserved words using a gperf-generated perfect hash function.
 
