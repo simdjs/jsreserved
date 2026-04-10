@@ -105,13 +105,12 @@ std::vector<std::string_view> build_input(
   return result;
 }
 
-// Generic benchmark: runs PHF, naive, and unordered_map on a given input vector.
-template <typename NaiveFn, typename GperfFn>
+// Generic benchmark: runs naive and gperf on a given input vector.
+template <typename NaiveFn>
 void bench_workload(const std::string &label,
                     std::vector<std::string_view> &input,
                     size_t num_strings,
                     NaiveFn naive_fn,
-                    GperfFn gperf_fn,
                     const BenchFilter &filter,
                     bool describe) {
   std::vector<int> results(num_strings, 0);
@@ -126,7 +125,7 @@ void bench_workload(const std::string &label,
     auto naive_bench = [&]() {
       for (size_t i = 0; i < input.size(); i++) {
         auto opt = naive_fn(input[i]);
-        if (opt) results[i] = *opt;
+        results[i] = opt.value_or(0);
       }
     };
     pretty_print(label + " naive", num_strings,
@@ -134,18 +133,31 @@ void bench_workload(const std::string &label,
     volatile auto sum = std::accumulate(results.begin(), results.end(), 0); // prevent optimization
   }
 
-
-  // gperf (GNU perfect hash)
+  // gperf (branchless GNU perfect hash with NEON)
+  // Pre-copy inputs into 16-byte buffers to avoid memcpy branches in the hot loop.
   if (filter.run_method("gperf")) {
-    gen.seed(42);
-    auto gperf_bench = [&]() {
+    struct alignas(16) BufEntry { char buf[16]; unsigned int len; };
+    std::vector<BufEntry> bufs(input.size());
+    auto rebuild_bufs = [&]() {
       for (size_t i = 0; i < input.size(); i++) {
-        auto result = gperf_fn(input[i]);
-        if (result) results[i] = *result;
+        std::memset(bufs[i].buf, 0, 16);
+        std::memcpy(bufs[i].buf, input[i].data(), input[i].size());
+        bufs[i].len = static_cast<unsigned int>(input[i].size());
+      }
+    };
+    rebuild_bufs();
+    gen.seed(42);
+    auto shuffle_and_rebuild = [&]() {
+      std::shuffle(input.begin(), input.end(), gen);
+      rebuild_bufs();
+    };
+    auto gperf_bench = [&]() {
+      for (size_t i = 0; i < bufs.size(); i++) {
+        results[i] = JsReservedGperf::lookup_branchless(bufs[i].buf, bufs[i].len);
       }
     };
     pretty_print(label + " gperf", num_strings,
-                 shuffle_bench(gperf_bench, shuffle));
+                 shuffle_bench(gperf_bench, shuffle_and_rebuild));
     volatile auto sum = std::accumulate(results.begin(), results.end(), 0); // prevent optimization
   }
 }
@@ -177,20 +189,10 @@ std::optional<int> jsreserved_naive(std::string_view s) {
   return std::nullopt;
 }
 
-auto gperf_jsreserved_fn = [](std::string_view s) -> std::optional<int> {
-  char buf[16] = {0};
-  size_t copy_len = std::min(s.size(), size_t(16));
-  std::memcpy(buf, s.data(), copy_len);
-  auto result = JsReservedGperf::lookup(buf, s.size());
-  if (result) return static_cast<int>(*result);
-  return std::nullopt;
-};
-
-// Run a full key-set benchmark with all three workload modes.
-template <typename NaiveFn, typename GperfFn>
+// Run a full key-set benchmark with all workload modes.
+template <typename NaiveFn>
 void run_keyset(const std::string &name,
                 NaiveFn naive_fn,
-                GperfFn gperf_fn,
                 const std::vector<std::string_view> &hit_keys,
                 const std::vector<std::string_view> &miss_keys,
                 const BenchFilter &filter,
@@ -220,15 +222,15 @@ void run_keyset(const std::string &name,
 
   if (filter.run_workload("hits")) {
     std::println("  --- all hits ---");
-    bench_workload("hits  ", hits, num_strings, jsreserved_naive, gperf_jsreserved_fn, filter, describe);
+    bench_workload("hits  ", hits, num_strings, naive_fn, filter, describe);
   }
   if (filter.run_workload("misses")) {
     std::println("  --- all misses ---");
-    bench_workload("misses", misses, num_strings, jsreserved_naive, gperf_jsreserved_fn, filter, describe);
+    bench_workload("misses", misses, num_strings, naive_fn, filter, describe);
   }
   if (filter.run_workload("mixed")) {
     std::println("  --- mixed (50/50) ---");
-    bench_workload("mixed ", mixed, num_strings, jsreserved_naive, gperf_jsreserved_fn, filter, describe);
+    bench_workload("mixed ", mixed, num_strings, naive_fn, filter, describe);
   }
 }
 
@@ -337,7 +339,7 @@ int main(int argc, char *argv[]) {
 
   // --- JavaScript Reserved Words (45 keys, medium) ---
   if (filter.run_keyset("jsreserved")) {
-    run_keyset("JavaScript Reserved Words", jsreserved_naive, gperf_jsreserved_fn,
+    run_keyset("JavaScript Reserved Words", jsreserved_naive,
       {"await","break","case","catch","class","const","continue","debugger","default","delete",
        "do","else","enum","export","extends","false","finally","for","function","if",
        "import","in","instanceof","new","null","return","super","switch","this","throw",

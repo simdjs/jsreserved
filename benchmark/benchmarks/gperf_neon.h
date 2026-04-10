@@ -64,6 +64,8 @@ private:
   static inline unsigned int hash (const char *str, unsigned int len);
 public:
   static std::optional<Token> lookup (const char *str, unsigned int len);
+  // Branchless variant: returns token value (>= 0) on match, -1 on miss.
+  static int lookup_branchless(const char *str, unsigned int len);
 };
 
 inline unsigned int
@@ -244,41 +246,188 @@ JsReservedGperf::lookup (const char *str, unsigned int len)
       "break"
     };
 
+#if defined(__aarch64__)
+  // Branchless path: compute everything unconditionally, single predictable branch at end.
+  // Caller guarantees str points to a zero-filled 16-byte buffer, so all accesses are safe.
+  static constexpr std::uint8_t masks[11][16] = {
+      {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,7,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,7,8,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,7,8,9,0x80,0x80,0x80,0x80,0x80,0x80},
+  };
+
+  // Clamp len and key to valid ranges (compiles to CSEL, no branches)
+  unsigned int safe_len = len < MIN_WORD_LENGTH ? MIN_WORD_LENGTH
+                        : (len > MAX_WORD_LENGTH ? MAX_WORD_LENGTH : len);
+  unsigned int key = hash(str, safe_len);
+  unsigned int safe_key = key > MAX_HASH_VALUE ? 0 : key;
+
+  // Always perform NEON comparison (no branch)
+  uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(str));
+  uint8x16_t mask_vec = vld1q_u8(masks[safe_len]);
+  uint8x16_t input = vqtbl1q_u8(raw, mask_vec);
+  uint8x16_t stored_vec = vld1q_u8(reinterpret_cast<const uint8_t*>(wordlist[safe_key]));
+  uint8x16_t cmp = vceqq_u8(input, stored_vec);
+  uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
+  uint64_t neon_result = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
+
+  // Combine all checks with bitwise AND (no short-circuit branches)
+  bool valid = (len >= MIN_WORD_LENGTH) & (len <= MAX_WORD_LENGTH)
+             & (key <= MAX_HASH_VALUE) & (neon_result == ~0ULL);
+
+  // Single branch: always taken for all-hits, never taken for all-misses
+  if (valid) return token_map[safe_key];
+  return std::nullopt;
+#else
   if (len <= MAX_WORD_LENGTH && len >= MIN_WORD_LENGTH)
     {
       unsigned int key = hash (str, len);
 
       if (key <= MAX_HASH_VALUE)
         {
-#if defined(__aarch64__) 
-          static constexpr std::uint8_t masks[11][16] = {
-              {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,4,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,4,5,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,4,5,6,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,4,5,6,7,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,4,5,6,7,8,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
-              {0,1,2,3,4,5,6,7,8,9,0x80,0x80,0x80,0x80,0x80,0x80},
-          };
-          uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(str));
-          uint8x16_t mask_vec = vld1q_u8(masks[len]);
-          uint8x16_t input = vqtbl1q_u8(raw, mask_vec);
-          uint8x16_t stored_vec = vld1q_u8(reinterpret_cast<const uint8_t*>(wordlist[key]));
-          uint8x16_t cmp = vceqq_u8(input, stored_vec);
-          uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
-          if (vget_lane_u64(vreinterpret_u64_u8(narrowed), 0) == ~0ULL)
-            return token_map[key];
-#else
           const char *s = wordlist[key];
 
           if (*str == *s && !strncmp (str + 1, s + 1, len - 1) && s[len] == '\0')
             return token_map[key];
-#endif
         }
     }
   return std::nullopt;
+#endif
 }
+
+#if defined(__aarch64__)
+__attribute__((noinline))
+int JsReservedGperf::lookup_branchless(const char *str, unsigned int len)
+{
+  enum
+    {
+      MIN_WORD_LENGTH = 2,
+      MAX_WORD_LENGTH = 10,
+      MAX_HASH_VALUE = 65
+    };
+
+  // Token values stored as plain ints; -1 = no token at this slot.
+  static const int token_map[66] = {
+    -1, -1,
+    21, // IN
+    23, // NEW
+    12, // ENUM
+    -1,
+    9,  // DELETE
+    8,  // DEFAULT
+    7,  // DEBUGGER
+    39, // INTERFACE
+    22, // INSTANCEOF
+    20, // IMPORT
+    19, // IF
+    -1, -1,
+    38, // IMPLEMENTS
+    -1,
+    16, // FINALLY
+    -1,
+    2,  // CASE
+    3,  // CATCH
+    -1,
+    10, // DO
+    -1,
+    24, // NULL
+    5,  // CONST
+    25, // RETURN
+    40, // PACKAGE
+    6,  // CONTINUE
+    36, // WITH
+    15, // FALSE
+    43, // PUBLIC
+    41, // PRIVATE
+    17, // FOR
+    42, // PROTECTED
+    26, // SUPER
+    44, // STATIC
+    -1,
+    18, // FUNCTION
+    -1,
+    37, // YIELD
+    27, // SWITCH
+    -1,
+    31, // TRY
+    30, // TRUE
+    0,  // AWAIT
+    13, // EXPORT
+    14, // EXTENDS
+    33, // VAR
+    28, // THIS
+    29, // THROW
+    -1, -1, -1,
+    34, // VOID
+    35, // WHILE
+    -1, -1, -1,
+    11, // ELSE
+    4,  // CLASS
+    32, // TYPEOF
+    -1, -1, -1,
+    1   // BREAK
+  };
+
+  static const char wordlist[][16] =
+    {
+      "", "",
+      "in", "new", "enum", "",
+      "delete", "default", "debugger", "interface", "instanceof",
+      "import", "if", "", "", "implements", "", "finally", "",
+      "case", "catch", "", "do", "", "null", "const", "return",
+      "package", "continue", "with", "false", "public", "private",
+      "for", "protected", "super", "static", "", "function", "",
+      "yield", "switch", "", "try", "true", "await", "export",
+      "extends", "var", "this", "throw", "", "", "",
+      "void", "while", "", "", "", "else", "class", "typeof",
+      "", "", "", "break"
+    };
+
+  static constexpr std::uint8_t masks[11][16] = {
+      {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,7,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,7,8,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+      {0,1,2,3,4,5,6,7,8,9,0x80,0x80,0x80,0x80,0x80,0x80},
+  };
+
+  // Clamp length to valid range (CSEL, no branch)
+  unsigned int safe_len = len < MIN_WORD_LENGTH ? MIN_WORD_LENGTH
+                        : (len > MAX_WORD_LENGTH ? MAX_WORD_LENGTH : len);
+  unsigned int key = hash(str, safe_len);
+  unsigned int safe_key = key > MAX_HASH_VALUE ? 0 : key;
+
+  // NEON comparison (always executed, no branch)
+  uint8x16_t raw = vld1q_u8(reinterpret_cast<const uint8_t*>(str));
+  uint8x16_t mask_vec = vld1q_u8(masks[safe_len]);
+  uint8x16_t input = vqtbl1q_u8(raw, mask_vec);
+  uint8x16_t stored_vec = vld1q_u8(reinterpret_cast<const uint8_t*>(wordlist[safe_key]));
+  uint8x16_t cmp = vceqq_u8(input, stored_vec);
+  uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(cmp), 4);
+  uint64_t neon_result = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
+
+  // Combine all validity flags into a single mask (no branches)
+  bool len_ok = (len >= MIN_WORD_LENGTH) & (len <= MAX_WORD_LENGTH);
+  bool key_ok = key <= MAX_HASH_VALUE;
+  bool match_ok = neon_result == ~0ULL;
+  // All-or-nothing: -1 if any check fails
+  int mask = -(int)(len_ok & key_ok & match_ok); // 0 or -1
+  // Branchless select: (token_map[safe_key] & mask) | (-1 & ~mask)
+  //   match:  (value & -1) | (-1 & 0) = value
+  //   miss:   (value & 0)  | (-1 & -1) = -1
+  return (token_map[safe_key] & mask) | (-1 & ~mask);
+}
+#endif
